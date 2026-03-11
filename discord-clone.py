@@ -89,87 +89,107 @@ def process_single_file(input_file, target_user_id, timeout_minutes, include_emb
     if current_msg:
         merged_messages.append(current_msg)
 
-    # --- PASS 2: Synthesize QA Pairs for this file ---
-    # Map EVERY original message ID to its finalized merged block
-    user_message_map = {}
-    for msg in merged_messages:
-        if msg["role"] == "user":
-            for orig_id in msg["original_ids"]:
-                user_message_map[orig_id] = {
-                    "content": msg["content"],
-                    "has_media": msg["has_media"]
-                }
+    # --- PASS 2: Synthesize Conversational Chains ---
+    file_chains = []
+    current_chain = []
+    chain_user_id = None
+    timeout_breaks = 0
 
-    file_pairs = []
-    timeout_skipped = 0
+    def save_current_chain(chain):
+        # A valid training chain should end with an assistant response
+        last_ast = -1
+        for idx in range(len(chain) - 1, -1, -1):
+            if chain[idx]["role"] == "assistant":
+                last_ast = idx
+                break
+
+        # Must have at least one User -> Assistant turn
+        if last_ast >= 1:
+            valid_chain = chain[:last_ast + 1]
+            formatted_thread = []
+
+            for m in valid_chain:
+                # 1. Strip URLs from assistant
+                raw_content = re.sub(r'https?://\S+', '', m["content"]) if m["role"] == "assistant" else m["content"]
+                # 2. Clean formatting
+                cleaned = clean_discord_formatting(raw_content).strip()
+
+                # 3. If any node in the chain is invalid (e.g., empty), discard the chain for quality
+                if not is_valid_text(cleaned):
+                    return False
+
+                formatted_thread.append({
+                    "role": m["role"],
+                    "content": cleaned
+                })
+
+            file_chains.append({
+                "id": valid_chain[0]["messageId"],
+                "thread": formatted_thread
+            })
+            return True
+        return False
 
     for i, msg in enumerate(merged_messages):
-        if msg["role"] == "assistant":
-            ast_has_media = msg["has_media"]
-            user_content = None
-            usr_has_media = False
+        added_to_chain = False
 
-            # Reference mapping logic (Now correctly checks all merged IDs)
-            if msg["referenceId"]:
-                ref_msg = user_message_map.get(msg["referenceId"])
-                if ref_msg:
-                    user_content = ref_msg["content"]
-                    usr_has_media = ref_msg["has_media"]
-            elif i > 0 and merged_messages[i - 1]["role"] == "user":
-                prev_msg = merged_messages[i - 1]
-                try:
-                    ast_time = datetime.fromisoformat(msg["timestamp"])
-                    usr_time = datetime.fromisoformat(prev_msg["timestamp"])
-                    diff_minutes = (ast_time - usr_time).total_seconds() / 60.0
+        if current_chain:
+            last_msg = current_chain[-1]
+            is_valid_next = False
 
-                    if diff_minutes <= timeout_minutes:
-                        user_content = prev_msg["content"]
-                        usr_has_media = prev_msg["has_media"]
-                    else:
-                        timeout_skipped += 1
-                        continue
-                except Exception:
-                    # Fallback if timestamp parsing fails
-                    user_content = prev_msg["content"]
-                    usr_has_media = prev_msg["has_media"]
+            # Check Temporal/Reference continuity
+            try:
+                curr_time = datetime.fromisoformat(msg["timestamp"])
+                last_time = datetime.fromisoformat(last_msg["timestamp"])
+                diff_minutes = (curr_time - last_time).total_seconds() / 60.0
+            except Exception:
+                diff_minutes = 0
 
-            # Skip this pair entirely if media is present and we aren't including them
-            if not include_embeds and (ast_has_media or usr_has_media):
-                continue
+            time_ok = diff_minutes <= timeout_minutes
+            ref_ok = (msg["referenceId"] in last_msg["original_ids"]) if msg["referenceId"] else False
 
-            if user_content is not None:
-                # 1. Strip URLs from the assistant's raw message
-                raw_assistant = re.sub(r'https?://\S+', '', msg["content"])
+            if time_ok or ref_ok:
+                # Alternating role logic:
+                if last_msg["role"] == "user" and msg["role"] == "assistant":
+                    is_valid_next = True
+                elif last_msg["role"] == "assistant" and msg["role"] == "user" and msg["authorId"] == chain_user_id:
+                    is_valid_next = True
 
-                # 2. Clean formatting and rigorously strip outer whitespace/newlines
-                assistant_content = clean_discord_formatting(raw_assistant).strip()
+            # Ensure media constraints are respected
+            if is_valid_next and not (not include_embeds and msg["has_media"]):
+                current_chain.append(msg)
+                added_to_chain = True
+            elif not (time_ok or ref_ok) and msg["role"] == "user":
+                 timeout_breaks += 1
 
-                # 3. Clean user formatting and rigorously strip outer whitespace/newlines
-                user_content = clean_discord_formatting(user_content).strip()
+        if not added_to_chain:
+            # Chain broken: Save existing chain if it meets criteria
+            if current_chain:
+                save_current_chain(current_chain)
+                current_chain = []
 
-                # 4. Final validation before saving
-                if is_valid_text(user_content) and is_valid_text(assistant_content):
-                    file_pairs.append({
-                        "id": msg["messageId"],
-                        "user": user_content,
-                        "assistant": assistant_content
-                    })
+            # Start a new chain if the interrupting message is a valid User start
+            if msg["role"] == "user" and not (not include_embeds and msg["has_media"]):
+                current_chain = [msg]
+                chain_user_id = msg["authorId"]
 
-    return file_pairs, len(raw_messages), timeout_skipped, None
+    # End of file catch-all
+    if current_chain:
+        save_current_chain(current_chain)
+
+    return file_chains, len(raw_messages), timeout_breaks, None
 
 def process_discord_data(input_files, target_user_id, timeout_minutes, max_threads, include_embeds):
     os.makedirs("paired", exist_ok=True)
     output_file = os.path.join("paired", f"{target_user_id}.json")
 
-    all_new_pairs = []
+    all_new_chains = []
     total_raw_messages = 0
-    total_timeout_skipped = 0
+    total_timeout_breaks = 0
 
     print(f"Spawning pool with {max_threads} threads for {len(input_files)} files...")
 
-    # Execute file processing concurrently
     with concurrent.futures.ThreadPoolExecutor(max_workers=max_threads) as executor:
-        # Map futures to filenames for error tracking
         futures = {
             executor.submit(process_single_file, f, target_user_id, timeout_minutes, include_embeds): f
             for f in input_files
@@ -178,14 +198,14 @@ def process_discord_data(input_files, target_user_id, timeout_minutes, max_threa
         for future in concurrent.futures.as_completed(futures):
             file_name = futures[future]
             try:
-                pairs, raw_count, skipped, err = future.result()
+                chains, raw_count, breaks, err = future.result()
                 if err:
                     print(f"[{file_name}] {err}")
                 else:
-                    all_new_pairs.extend(pairs)
+                    all_new_chains.extend(chains)
                     total_raw_messages += raw_count
-                    total_timeout_skipped += skipped
-                    print(f"[{file_name}] Done. Found {len(pairs)} pairs from {raw_count} messages.")
+                    total_timeout_breaks += breaks
+                    print(f"[{file_name}] Done. Found {len(chains)} conversation chains from {raw_count} messages.")
             except Exception as e:
                 print(f"[{file_name}] Thread generated an exception: {e}")
 
@@ -195,54 +215,52 @@ def process_discord_data(input_files, target_user_id, timeout_minutes, max_threa
 
     # --- PASS 3: Append, Deduplicate, and Sort (Synchronous) ---
     print("\nSynchronizing and merging into main dataset...")
-    existing_messages = []
+    existing_chains = []
     if os.path.exists(output_file):
         try:
             with open(output_file, 'r', encoding='utf-8') as f:
                 existing_data = json.load(f)
-                existing_messages = existing_data.get("messages", [])
-            print(f"Found existing '{output_file}' with {len(existing_messages)} pairs.")
+                existing_chains = existing_data.get("conversations", [])
+            print(f"Found existing '{output_file}' with {len(existing_chains)} chains.")
         except Exception as e:
             print(f"Warning: Could not read existing {output_file}. Starting fresh. Error: {e}")
 
-    unique_pairs = {}
+    unique_chains = {}
+    for chain in existing_chains:
+        if "id" in chain:
+            unique_chains[chain["id"]] = chain
 
-    for pair in existing_messages:
-        if "id" in pair:
-            unique_pairs[pair["id"]] = pair
+    for chain in all_new_chains:
+        unique_chains[chain["id"]] = chain
 
-    for pair in all_new_pairs:
-        unique_pairs[pair["id"]] = pair
-
-    final_messages = sorted(unique_pairs.values(), key=lambda x: int(x["id"]))
+    final_chains = sorted(unique_chains.values(), key=lambda x: int(x["id"]))
 
     # --- SAVE FINAL OUTPUT ---
     with open(output_file, 'w', encoding='utf-8') as f:
-        json.dump({"messages": final_messages}, f, indent=2, ensure_ascii=False)
+        # Renamed array to 'conversations' to reflect the new structure
+        json.dump({"conversations": final_chains}, f, indent=2, ensure_ascii=False)
 
-    added_count = len(final_messages) - len(existing_messages)
+    added_count = len(final_chains) - len(existing_chains)
 
     print(f"\n--- DONE ---")
     print(f"Processed {total_raw_messages} raw messages.")
-    print(f"Filtered out {total_timeout_skipped} pairs due to the {timeout_minutes}-minute timeout.")
     if not include_embeds:
         print("Embeds and attachments were filtered out.")
-    print(f"Added {max(0, added_count)} new unique QA pairs.")
-    print(f"Total dataset size: {len(final_messages)} pairs.")
+    print(f"Added {max(0, added_count)} new unique conversation chains.")
+    print(f"Total dataset size: {len(final_chains)} chains.")
     print(f"Saved dataset to: {output_file}")
 
 def main():
-    parser = argparse.ArgumentParser(description="Multithreaded processor for Discord JSON exports to QA pairs.")
+    parser = argparse.ArgumentParser(description="Multithreaded processor for Discord JSON exports to Conversational Chains.")
     parser.add_argument("userid", type=int, help="The target user ID to train on")
     parser.add_argument("input_files", nargs="*", help="Path to raw Discord JSON files (defaults to all .json in cwd)")
-    parser.add_argument("--timeout", type=int, default=10, help="Max minutes between messages to form a pair (default: 10)")
+    parser.add_argument("--timeout", type=int, default=10, help="Max minutes between messages to continue a chain (default: 10)")
     parser.add_argument("--include-embeds", action="store_true", help="Include pairs with embeds/attachments (default: exclude)")
 
     default_threads = min(32, (os.cpu_count() or 1) * 2)
     parser.add_argument("--threads", "-t", type=int, default=default_threads, help=f"Number of threads to use (default: {default_threads})")
 
     args = parser.parse_args()
-
     files_to_process = args.input_files
 
     if not files_to_process:
@@ -250,7 +268,6 @@ def main():
         if not files_to_process:
             print("Error: No input files provided and no .json files found in the current directory.")
             sys.exit(1)
-
         print(f"Found {len(files_to_process)} .json file(s) in the current directory.")
 
     process_discord_data(files_to_process, args.userid, args.timeout, args.threads, args.include_embeds)
